@@ -1,16 +1,19 @@
 import os
 from datetime import datetime, timedelta
+import asyncio
 
 import pandas as pd
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Page
+from playwright.async_api import async_playwright, Page as AsyncPage
 from pydantic import BaseModel, HttpUrl, Field
+import sqlite3
 
 # === Constants ===
 BASE_URL = "https://www.gpw.pl"
 URLS_FILE = "data/company_urls.csv"
 OUTPUT_DIR = "data"
 LOG_FILE = os.path.join(OUTPUT_DIR, "scrape_log.csv")
+SQLITE_DB = os.path.join(OUTPUT_DIR, "gpw_data.sqlite")
 
 TABS = {
     "info": "#infoTab",
@@ -20,7 +23,7 @@ TABS = {
     "reports2": "#reportsTab2",
     "shareholders": "#shareholdersTab",
     "notoria": "#showNotoria",
-    "onp": "#onpTab",
+    # "onp": "#onpTab",
 }
 
 # Ensure output directory
@@ -31,6 +34,7 @@ class CompanyData(BaseModel):
     url: HttpUrl
     isin: str
     name: str | None = None
+    description: str | None = None
     ticker: str | None = None
     full_name: str | None = None
     president: str | None = None
@@ -81,16 +85,16 @@ class NotoriaMetric(BaseModel):
     metric: str
     value: str
 
-class OnpEvent(BaseModel):
-    company_url: HttpUrl
-    last_day_with_right: str
-    operation_type: str
-    parameter: str
+# class OnpEvent(BaseModel):
+#     company_url: HttpUrl
+#     last_day_with_right: str
+#     operation_type: str
+#     parameter: str
 
 # === Parsing Helpers ===
 
 def get_text_from(soup: BeautifulSoup, selector: str, label_contains: str) -> str | None:
-    row = soup.select_one(f"{selector} tr:has(th:contains('{label_contains}')) td")
+    row = soup.select_one(f"{selector} tr:has(th:-soup-contains('{label_contains}')) td")
     return row.get_text(strip=True).replace("\xa0", " ") if row else None
 
 # === Extractors ===
@@ -101,7 +105,7 @@ def parse_core(html: str, url: str) -> CompanyData:
     info = TABS['info']
     quo = TABS['quotations']
     # index membership
-    qs = soup.select(f"{quo} tr:has(th:contains('Przynależność do indeksu')) td a")
+    qs = soup.select(f"{quo} tr:has(th:-soup-contains('Przynależność do indeksu')) td a")
     indexes = [a.get_text(strip=True) for a in qs]
     return CompanyData(
         url=url,
@@ -193,22 +197,22 @@ def extract_notoria(soup: BeautifulSoup, url: HttpUrl) -> list[NotoriaMetric]:
     return out
 
 
-def extract_onp(soup: BeautifulSoup, url: HttpUrl) -> list[OnpEvent]:
-    rows = soup.select(f"{TABS['onp']} table tbody tr")
-    out = []
-    for row in rows:
-        if row.find('th'):
-            continue
-        cells = row.select('td')
-        if len(cells) < 3:
-            continue
-        out.append(OnpEvent(
-            company_url=url,
-            last_day_with_right=cells[0].text.strip(),
-            operation_type=cells[1].text.strip(),
-            parameter=cells[2].text.strip(),
-        ))
-    return out
+# def extract_onp(soup: BeautifulSoup, url: HttpUrl) -> list[OnpEvent]:
+#     rows = soup.select(f"{TABS['onp']} table tbody tr")
+#     out = []
+#     for row in rows:
+#         if row.find('th'):
+#             continue
+#         cells = row.select('td')
+#         if len(cells) < 3:
+#             continue
+#         out.append(OnpEvent(
+#             company_url=url,
+#             last_day_with_right=cells[0].text.strip(),
+#             operation_type=cells[1].text.strip(),
+#             parameter=cells[2].text.strip(),
+#         ))
+#     return out
 
 
 def load_scrape_log() -> dict[str, datetime]:
@@ -272,97 +276,148 @@ def update_csv(filename: str, rows: list[dict], url_key='url'):
     
     df_updated.to_csv(filepath, index=False)
 
-# === Main scraping routine ===
-def scrape_all():
+def get_sqlite_conn():
+    return sqlite3.connect(SQLITE_DB)
+
+def update_sqlite(table: str, rows: list[dict], url_key='url'):
+    if not rows:
+        return
+    conn = get_sqlite_conn()
+    df_new = pd.DataFrame(rows)
+    # Remove existing rows with the same url/company_url
+    if url_key not in df_new.columns:
+        possible_url_cols = [col for col in df_new.columns if 'url' in col]
+        if possible_url_cols:
+            url_key = possible_url_cols[0]
+    try:
+        df_existing = pd.read_sql(f'SELECT * FROM {table}', conn)
+        if url_key in df_existing.columns:
+            df_existing = df_existing[df_existing[url_key] != rows[0][url_key]]
+            df_updated = pd.concat([df_existing, df_new], ignore_index=True)
+        else:
+            df_updated = df_new
+    except Exception:
+        # Table does not exist yet
+        df_updated = df_new
+    df_updated.to_sql(table, conn, if_exists='replace', index=False)
+    conn.close()
+
+
+def process_company_data(url: str, tab_html: dict, description: str | None):
+    """Extract all company data and update SQLite tables."""
+    def to_serializable(d):
+        # Recursively convert HttpUrl and other non-serializable types to str
+        if isinstance(d, dict):
+            return {k: to_serializable(v) for k, v in d.items()}
+        elif isinstance(d, list):
+            # If it's a list of strings, join with comma
+            if all(isinstance(x, str) for x in d):
+                return ','.join(d)
+            else:
+                return [to_serializable(x) for x in d]
+        elif isinstance(d, (HttpUrl,)):
+            return str(d)
+        return d
+
+    company_data = []
+    reports_data = []
+    shareholders_data = []
+    notoria_data = []
+    # onp_data = []
+    merged_html = tab_html['info'] + tab_html['indicators'] + tab_html['quotations']
+    cd = parse_core(merged_html, url)
+    cd.description = description
+    company_data.append(to_serializable(cd.model_dump()))
+    for key in ('reports1', 'reports2'):
+        soup = BeautifulSoup(tab_html[key], 'html.parser')
+        reps = extract_reports(soup, key, url)
+        for r in reps:
+            reports_data.append(to_serializable(r.model_dump()))
+    soup = BeautifulSoup(tab_html['shareholders'], 'html.parser')
+    shs = extract_shareholders(soup, url)
+    for sh in shs:
+        shareholders_data.append(to_serializable(sh.model_dump()))
+    soup = BeautifulSoup(tab_html['notoria'], 'html.parser')
+    nts = extract_notoria(soup, url)
+    for n in nts:
+        notoria_data.append(to_serializable(n.model_dump()))
+    # soup = BeautifulSoup(tab_html['onp'], 'html.parser')
+    # onp_events = extract_onp(soup, url)
+    # for e in onp_events:
+    #     onp_data.append(to_serializable(e.model_dump()))
+    
+    print(f"✅ Processed {url} - Company: {cd.name}, Description: {cd.description[:30]}...")
+    update_sqlite("company_company", company_data, url_key='url')
+    update_sqlite("company_reports", reports_data, url_key='company_url')
+    update_sqlite("company_shareholders", shareholders_data, url_key='company_url')
+    update_sqlite("company_notoria", notoria_data, url_key='company_url')
+    # update_sqlite("company_onp", onp_data, url_key='company_url')
+
+BATCH_SIZE = 1 # Number of pages to open in parallel
+
+async def extract_description_async(page: AsyncPage) -> str | None:
+
+    return (await page.locator("div.comapny-description > div:nth-child(2)").inner_text(timeout=3000)).strip()
+
+
+async def collect_tab_html_async(page: AsyncPage) -> dict:
+    tab_html = {'info': await page.content()}
+    tab_selectors = {
+        'indicators': '#indicatorsTab table',
+        'quotations': '#quotationsTab table',
+        'reports1': '#reportsTab1 table',
+        'reports2': '#reportsTab2 table',
+        'shareholders': '#shareholdersTab table',
+        'notoria': '#showNotoria table',
+        # 'onp': '#onpTab table',
+    }
+    for tab_key in ['indicators', 'quotations', 'reports1', 'reports2', 'shareholders', 'notoria']:
+        selector = f'a.nav-link[href="{TABS[tab_key]}"]'
+        try:
+            await page.click(selector, timeout=15000)
+            await page.wait_for_selector(tab_selectors[tab_key], timeout=5000)
+            tab_html[tab_key] = await page.content()
+        except Exception as e:
+            print(f"⚠️ Could not click or wait for {tab_key}: {e}")
+            tab_html[tab_key] = await page.content()
+    return tab_html
+
+async def scrape_url_async(context, url, scrape_log, skip_threshold, semaphore):
+    async with semaphore:
+        last = scrape_log.get(url)
+        if last and last > skip_threshold:
+            print(f"⏭ Skipping (recently scraped): {url}")
+            return url, False
+        print(f"🔍 Scraping: {url}")
+        page: AsyncPage = await context.new_page()
+        try:
+            await page.goto(url, timeout=30000)
+            description = await extract_description_async(page)
+            tab_html = await collect_tab_html_async(page)
+            process_company_data(url, tab_html, description)
+            scrape_log[url] = datetime.now()
+            save_scrape_log(scrape_log)
+            return url, True
+        except Exception as e:
+            print(f"⚠️ Error for {url}: {e}")
+            return url, False
+        finally:
+            await page.close()
+
+async def scrape_all_async():
     urls = pd.read_csv(URLS_FILE, header=None, names=['url'])['url'].tolist()
     scrape_log = load_scrape_log()
     now = datetime.now()
     skip_threshold = now - timedelta(days=1)
+    semaphore = asyncio.Semaphore(BATCH_SIZE)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        tasks = [scrape_url_async(context, url, scrape_log, skip_threshold, semaphore) for url in urls]
+        await asyncio.gather(*tasks)
+        await browser.close()
 
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-
-        for url in urls:
-            last = scrape_log.get(url)
-            if last and last > skip_threshold:
-                print(f"⏭ Skipping (recently scraped): {url}")
-                continue
-
-            print(f"🔍 Scraping: {url}")
-            page: Page = context.new_page()
-            try:
-                page.goto(url, timeout=15000)
-                # --- Click and parse each tab ---
-                tab_html = {}
-                # Info tab (default loaded)
-                tab_html['info'] = page.content()
-                # Click and collect for each tab using the <a> nav-link
-                for tab_key in ['indicators', 'quotations', 'reports1', 'reports2', 'shareholders', 'notoria', 'onp']:
-                    selector = f'a.nav-link[href="{TABS[tab_key]}"]'
-                    try:
-                        page.click(selector, timeout=5000)
-                        page.wait_for_timeout(1000)  # Wait for content to load
-                        tab_html[tab_key] = page.content()
-                    except Exception as e:
-                        print(f"⚠️ Could not click {tab_key} for {url}: {e}")
-                        tab_html[tab_key] = page.content()  # fallback
-
-                # --- Use the correct HTML for each extraction ---
-                company_data = []
-                reports_data = []
-                shareholders_data = []
-                notoria_data = []
-                onp_data = []
-
-                # Core (use info, indicators, quotations)
-                merged_html = tab_html['info'] + tab_html['indicators'] + tab_html['quotations']
-                cd = parse_core(merged_html, url)
-                company_data.append(cd.model_dump())
-
-                # Reports
-                for key in ('reports1', 'reports2'):
-                    soup = BeautifulSoup(tab_html[key], 'html.parser')
-                    reps = extract_reports(soup, key, url)
-                    for r in reps:
-                        reports_data.append(r.model_dump())
-
-                # Shareholders
-                soup = BeautifulSoup(tab_html['shareholders'], 'html.parser')
-                shs = extract_shareholders(soup, url)
-                for sh in shs:
-                    shareholders_data.append(sh.model_dump())
-
-                # Notoria
-                soup = BeautifulSoup(tab_html['notoria'], 'html.parser')
-                nts = extract_notoria(soup, url)
-                for n in nts:
-                    notoria_data.append(n.model_dump())
-
-                # Onp
-                soup = BeautifulSoup(tab_html['onp'], 'html.parser')
-                onp_events = extract_onp(soup, url)
-                for e in onp_events:
-                    onp_data.append(e.model_dump())
-
-                scrape_log[url] = datetime.now()
-                save_scrape_log(scrape_log)
-
-                update_csv("company_company.csv", company_data, url_key='url')
-                update_csv("company_reports.csv", reports_data, url_key='company_url')
-                update_csv("company_shareholders.csv", shareholders_data, url_key='company_url')
-                update_csv("company_notoria.csv", notoria_data, url_key='company_url')
-                update_csv("company_onp.csv", onp_data, url_key='company_url')
-
-            except Exception as e:
-                print(f"⚠️ Error for {url}: {e}")
-            finally:
-                page.close()
-
-
-        browser.close()
 
 
 if __name__ == '__main__':
-    scrape_all()
+    asyncio.run(scrape_all_async())
